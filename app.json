@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "ClinicApp",
+    "slug": "clinic-billing-test",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "clinicapp",
+    "platforms": ["ios", "android", "web"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "ch.blackcode.clinictest"
+    },
+    "android": {
+      "package": "ch.blackcode.clinictest"
+    },
+    "plugins": [
+      "@react-native-firebase/app",
+      "@stripe/stripe-react-native"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
