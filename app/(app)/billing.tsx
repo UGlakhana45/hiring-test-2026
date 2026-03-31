@@ -2,9 +2,11 @@ import React, { useEffect, useState } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, TouchableOpacity, Alert,
 } from 'react-native';
+import { useLocalSearchParams } from 'expo-router';
 import { useAuth } from '@/hooks/useAuth';
 import { useClinic } from '@/hooks/useClinic';
 import { useSubscription } from '@/hooks/useSubscription';
+import { useAuthStore } from '@/store/authStore';
 import { getClinicAddons, getClinicDiscounts } from '@/services/firestore';
 import { PlanBadge } from '@/components/PlanBadge';
 import { SeatUsageBar } from '@/components/SeatUsageBar';
@@ -19,6 +21,14 @@ export default function BillingScreen() {
   const { plan, status, config, seatsUsed, seatsMax } = useSubscription();
   const [addons, setAddons] = useState<Addon[]>([]);
   const [discounts, setDiscounts] = useState<Discount[]>([]);
+  const params = useLocalSearchParams<{ success?: string }>();
+
+  // Force-refresh claims after checkout redirect so plan updates show immediately
+  useEffect(() => {
+    if (params.success === 'true') {
+      useAuthStore.getState().refreshIdToken();
+    }
+  }, [params.success]);
 
   useEffect(() => {
     if (!clinic) return;

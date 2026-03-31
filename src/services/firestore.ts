@@ -23,7 +23,7 @@ export function subscribeToClinic(
     .collection('clinics')
     .doc(clinicId)
     .onSnapshot((snap) => {
-      if (snap.exists()) {
+      if (snap.exists) {
         onUpdate({ id: snap.id, ...snap.data() } as Clinic);
       }
     });
@@ -33,7 +33,7 @@ export function subscribeToClinic(
 
 export async function getUser(userId: string): Promise<User | null> {
   const snap = await firestore().collection('users').doc(userId).get();
-  if (!snap.exists()) return null;
+  if (!snap.exists) return null;
   return { id: snap.id, ...snap.data() } as User;
 }
 
@@ -55,7 +55,7 @@ export function subscribeToSubscription(
     .collection('subscriptions')
     .doc(clinicId)
     .onSnapshot((snap) => {
-      if (snap.exists()) {
+      if (snap.exists) {
         onUpdate({ clinicId, ...snap.data() } as Subscription);
       }
     });

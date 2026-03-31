@@ -27,6 +27,8 @@ export type Subscription = {
   stripeSubscriptionId: string | null;
   // Set during grace period — how long until plan reverts
   gracePeriodEnd: Timestamp | null;
+  downgradeAt: Timestamp | null;
+  scheduledPlan: Plan | null;
 };
 
 // Plan metadata — source of truth for seat limits and pricing

@@ -1,24 +1,22 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import Stripe from 'stripe';
+import { syncCustomClaimsForAllClinicMembers } from '../auth/claims';
+import { primaryPlanFromStripeItems } from './priceIds';
+import { PLAN_CONFIG_SERVER, planSeatsForClaims } from './planConfig';
+import { planTier, type PlanId } from '../types/authClaims';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-09-30.acacia',
+  apiVersion: '2025-02-24.acacia',
 });
 
-const GRACE_PERIOD_DAYS = 7; // Document: chosen to match Stripe's own retry window
+const GRACE_PERIOD_DAYS = 7; // Matches Stripe Smart Retries window
 
-/**
- * Stripe webhook handler.
- * All billing state in Firestore is written here — never from the client.
- *
- * Events handled:
- *   - checkout.session.completed  → activate subscription
- *   - customer.subscription.updated → sync plan changes
- *   - invoice.payment_succeeded   → reset grace period, restore status
- *   - invoice.payment_failed      → enter grace period (Scenario 4)
- *   - customer.subscription.deleted → cancel subscription, revert to Free
- */
+function stripeTs(unix: number): admin.firestore.Timestamp {
+  return admin.firestore.Timestamp.fromDate(new Date(unix * 1000));
+}
+
+/** Stripe webhook — single entry point for all billing state changes. */
 export const handleStripeWebhook = functions.https.onRequest(async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
@@ -56,29 +54,14 @@ export const handleStripeWebhook = functions.https.onRequest(async (req, res) =>
       }
 
       case 'invoice.payment_failed': {
-        // TODO [CHALLENGE]: Implement Scenario 4 — payment failure → grace period.
-        // Steps:
-        //   1. Look up the clinic by stripeCustomerId
-        //   2. Set subscription.status = 'grace_period'
-        //   3. Set subscription.gracePeriodEnd = now + GRACE_PERIOD_DAYS
-        //   4. Write to Firestore — Firestore rules will enforce restrictions automatically
-        //   5. Optionally: send a notification (email/push) to the owner
-        //
-        // Decision point: GRACE_PERIOD_DAYS is set to 7 above.
-        // Rationale: matches Stripe's Smart Retries window, so by the time grace ends,
-        // Stripe has already given up retrying.
         const invoice = event.data.object as Stripe.Invoice;
-        console.log('TODO [CHALLENGE]: Handle payment failure for invoice', invoice.id);
+        await handlePaymentFailed(db, invoice);
         break;
       }
 
       case 'customer.subscription.deleted': {
-        // TODO [CHALLENGE]: Handle subscription cancellation.
-        // Revert plan to 'free', status to 'canceled'.
-        // Deactivate seats exceeding free plan limit (1 seat).
-        // Owner keeps their seat; excess staff are deactivated.
         const sub = event.data.object as Stripe.Subscription;
-        console.log('TODO [CHALLENGE]: Handle subscription deleted for', sub.id);
+        await handleSubscriptionDeleted(db, sub);
         break;
       }
 
@@ -93,19 +76,36 @@ export const handleStripeWebhook = functions.https.onRequest(async (req, res) =>
   }
 });
 
+// ---------------------------------------------------------------------------
+// checkout.session.completed
+// ---------------------------------------------------------------------------
+
 async function handleCheckoutCompleted(
   db: admin.firestore.Firestore,
   session: Stripe.Checkout.Session,
 ): Promise<void> {
   const clinicId = session.metadata?.clinicId;
-  const plan = session.metadata?.plan as 'pro' | 'premium' | 'vip';
+  const plan = session.metadata?.plan as PlanId | undefined;
 
   if (!clinicId || !plan) {
     throw new Error('Missing clinicId or plan in session metadata');
   }
 
-  const { PLAN_CONFIG_SERVER } = await import('./planConfig');
   const planConfig = PLAN_CONFIG_SERVER[plan];
+
+  let periodEnd = admin.firestore.Timestamp.fromDate(
+    new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+  );
+  if (typeof session.subscription === 'string') {
+    try {
+      const stripeSub = await stripe.subscriptions.retrieve(session.subscription);
+      if (stripeSub.current_period_end) {
+        periodEnd = stripeTs(stripeSub.current_period_end);
+      }
+    } catch {
+      /* fall back to ~30d estimate */
+    }
+  }
 
   await db.runTransaction(async (tx) => {
     const subRef = db.collection('subscriptions').doc(clinicId);
@@ -117,44 +117,120 @@ async function handleCheckoutCompleted(
       status: 'active',
       stripeCustomerId: session.customer,
       stripeSubscriptionId: session.subscription,
-      currentPeriodEnd: admin.firestore.Timestamp.fromDate(
-        new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // ~1 month
-      ),
+      currentPeriodEnd: periodEnd,
       gracePeriodEnd: null,
+      downgradeAt: null,
+      scheduledPlan: null,
     }, { merge: true });
 
-    // Update clinic's plan mirror and seat max
     tx.update(clinicRef, {
       plan,
       'seats.max': planConfig.seats,
     });
   });
+
+  await syncCustomClaimsForAllClinicMembers(db, clinicId);
 }
+
+// ---------------------------------------------------------------------------
+// customer.subscription.updated
+// ---------------------------------------------------------------------------
 
 async function handleSubscriptionUpdated(
   db: admin.firestore.Firestore,
-  stripeSubscription: Stripe.Subscription,
+  stripeSub: Stripe.Subscription,
 ): Promise<void> {
-  // Find clinic by stripeSubscriptionId
   const snap = await db
     .collection('subscriptions')
-    .where('stripeSubscriptionId', '==', stripeSubscription.id)
+    .where('stripeSubscriptionId', '==', stripeSub.id)
     .limit(1)
     .get();
 
   if (snap.empty) {
-    console.warn('No clinic found for subscription', stripeSubscription.id);
+    console.warn('No clinic found for subscription', stripeSub.id);
     return;
   }
 
   const subDoc = snap.docs[0];
   const clinicId = subDoc.id;
+  const currentData = subDoc.data();
+  const currentPlan = (currentData?.plan as PlanId) ?? 'free';
 
-  // Stripe stores the current plan in the subscription items
-  // TODO [CHALLENGE]: Parse the plan from stripeSubscription.items to determine the new plan
-  // and update Firestore accordingly. This is called on upgrades and downgrades.
-  console.log('TODO [CHALLENGE]: Sync subscription update for clinic', clinicId);
+  const newPlan = primaryPlanFromStripeItems(stripeSub.items);
+  const periodEnd = stripeTs(stripeSub.current_period_end);
+  const now = new Date();
+
+  const pendingDowngradeAt = currentData?.downgradeAt?.toDate?.() as Date | undefined;
+  if (pendingDowngradeAt && pendingDowngradeAt <= now) {
+    const scheduledPlan = (currentData?.scheduledPlan as PlanId) ?? newPlan ?? 'free';
+    const targetConfig = PLAN_CONFIG_SERVER[scheduledPlan] ?? PLAN_CONFIG_SERVER.free;
+
+    await db.runTransaction(async (tx) => {
+      tx.update(subDoc.ref, {
+        plan: scheduledPlan,
+        status: 'active',
+        currentPeriodEnd: periodEnd,
+        downgradeAt: null,
+        scheduledPlan: null,
+      });
+      tx.update(db.collection('clinics').doc(clinicId), {
+        plan: scheduledPlan,
+        'seats.max': targetConfig.seats,
+      });
+    });
+
+    await syncCustomClaimsForAllClinicMembers(db, clinicId);
+    return;
+  }
+
+  if (!newPlan) {
+    console.warn('Could not determine plan from subscription items for', stripeSub.id);
+    await subDoc.ref.update({ currentPeriodEnd: periodEnd });
+    return;
+  }
+
+  const currentTier = planTier(currentPlan);
+  const newTier = planTier(newPlan);
+
+  if (newTier > currentTier) {
+    const targetConfig = PLAN_CONFIG_SERVER[newPlan];
+    await db.runTransaction(async (tx) => {
+      tx.update(subDoc.ref, {
+        plan: newPlan,
+        status: 'active',
+        currentPeriodEnd: periodEnd,
+        downgradeAt: null,
+        scheduledPlan: null,
+      });
+      tx.update(db.collection('clinics').doc(clinicId), {
+        plan: newPlan,
+        'seats.max': targetConfig.seats,
+      });
+    });
+    await syncCustomClaimsForAllClinicMembers(db, clinicId);
+  } else if (newTier < currentTier) {
+    // Mid-cycle downgrade: keep current tier, schedule the swap for period end
+    if (!currentData?.downgradeAt) {
+      await subDoc.ref.update({
+        downgradeAt: periodEnd,
+        scheduledPlan: newPlan,
+        currentPeriodEnd: periodEnd,
+      });
+    } else {
+      await subDoc.ref.update({ currentPeriodEnd: periodEnd });
+    }
+  } else {
+    await subDoc.ref.update({
+      currentPeriodEnd: periodEnd,
+      status: 'active',
+    });
+    await syncCustomClaimsForAllClinicMembers(db, clinicId);
+  }
 }
+
+// ---------------------------------------------------------------------------
+// invoice.payment_succeeded
+// ---------------------------------------------------------------------------
 
 async function handlePaymentSucceeded(
   db: admin.firestore.Firestore,
@@ -170,8 +246,119 @@ async function handlePaymentSucceeded(
 
   if (snap.empty) return;
 
-  await snap.docs[0].ref.update({
+  const subDoc = snap.docs[0];
+  const clinicId = subDoc.id;
+
+  await subDoc.ref.update({
     status: 'active',
     gracePeriodEnd: null,
   });
+
+  await syncCustomClaimsForAllClinicMembers(db, clinicId);
+}
+
+// ---------------------------------------------------------------------------
+// invoice.payment_failed
+// ---------------------------------------------------------------------------
+
+async function handlePaymentFailed(
+  db: admin.firestore.Firestore,
+  invoice: Stripe.Invoice,
+): Promise<void> {
+  if (!invoice.customer) return;
+
+  const snap = await db
+    .collection('subscriptions')
+    .where('stripeCustomerId', '==', invoice.customer)
+    .limit(1)
+    .get();
+
+  if (snap.empty) return;
+
+  const gracePeriodEnd = admin.firestore.Timestamp.fromDate(
+    new Date(Date.now() + GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000),
+  );
+
+  await snap.docs[0].ref.update({
+    status: 'grace_period',
+    gracePeriodEnd,
+  });
+
+}
+
+// ---------------------------------------------------------------------------
+// customer.subscription.deleted
+// ---------------------------------------------------------------------------
+
+async function handleSubscriptionDeleted(
+  db: admin.firestore.Firestore,
+  stripeSub: Stripe.Subscription,
+): Promise<void> {
+  const snap = await db
+    .collection('subscriptions')
+    .where('stripeSubscriptionId', '==', stripeSub.id)
+    .limit(1)
+    .get();
+
+  if (snap.empty) return;
+
+  const subDoc = snap.docs[0];
+  const clinicId = subDoc.id;
+  const freeConfig = PLAN_CONFIG_SERVER.free;
+
+  await db.runTransaction(async (tx) => {
+    tx.update(subDoc.ref, {
+      plan: 'free',
+      status: 'canceled',
+      stripeSubscriptionId: null,
+      gracePeriodEnd: null,
+      downgradeAt: null,
+      scheduledPlan: null,
+    });
+    tx.update(db.collection('clinics').doc(clinicId), {
+      plan: 'free',
+      'seats.max': freeConfig.seats,
+    });
+  });
+
+  const seatsSnap = await db
+    .collection('seats')
+    .doc(clinicId)
+    .collection('members')
+    .where('active', '==', true)
+    .get();
+
+  const activeMembers = seatsSnap.docs;
+  if (activeMembers.length > freeConfig.seats) {
+    const toDeactivate = activeMembers
+      .filter((d) => d.data()?.role !== 'owner')
+      .slice(0, activeMembers.length - freeConfig.seats);
+
+    // Wipe claims before clearing clinicId — syncCustomClaims queries by clinicId
+    for (const member of toDeactivate) {
+      await admin.auth().setCustomUserClaims(member.id, {
+        clinicId: null,
+        planId: 'free',
+        claimRole: 'patient',
+        seatLimit: 0,
+        activeAddons: [],
+      });
+      await admin.auth().revokeRefreshTokens(member.id);
+    }
+
+    const batch = db.batch();
+    for (const member of toDeactivate) {
+      batch.update(member.ref, { active: false });
+      batch.update(db.collection('users').doc(member.id), {
+        clinicId: null,
+        role: 'patient',
+      });
+    }
+    batch.update(db.collection('clinics').doc(clinicId), {
+      'seats.used': admin.firestore.FieldValue.increment(-toDeactivate.length),
+    });
+    await batch.commit();
+  }
+
+  await syncCustomClaimsForAllClinicMembers(db, clinicId);
 }
