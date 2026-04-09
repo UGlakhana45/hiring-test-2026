@@ -4,18 +4,39 @@
     "slug": "clinic-billing-test",
     "version": "1.0.0",
     "orientation": "portrait",
+    "newArchEnabled": true,
     "scheme": "clinicapp",
-    "platforms": ["ios", "android", "web"],
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "ch.blackcode.clinictest"
+      "bundleIdentifier": "org.reactjs.native.example.myapp",
+      "googleServicesFile": "./GoogleService-Info.plist"
     },
     "android": {
       "package": "ch.blackcode.clinictest"
     },
     "plugins": [
       "@react-native-firebase/app",
-      "@stripe/stripe-react-native"
+      [
+        "@stripe/stripe-react-native",
+        {
+          "merchantIdentifier": "merchant.ch.blackcode.clinictest",
+          "enableGooglePay": false
+        }
+      ],
+      "expo-asset",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "static"
+          }
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

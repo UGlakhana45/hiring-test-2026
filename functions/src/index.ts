@@ -1,3 +1,4 @@
+import './loadEnv';
 import * as admin from 'firebase-admin';
 
 // Initialize Firebase Admin

@@ -2,13 +2,6 @@ import auth from '@react-native-firebase/auth';
 import firestore from '@react-native-firebase/firestore';
 import type { User } from '@/types/user';
 
-const USE_EMULATOR = process.env.EXPO_PUBLIC_USE_EMULATOR === 'true';
-const EMULATOR_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
-
-if (USE_EMULATOR) {
-  auth().useEmulator(`http://${EMULATOR_HOST}:9099`);
-}
-
 export async function signUp(
   email: string,
   password: string,
@@ -44,15 +37,8 @@ export async function refreshAuthToken(): Promise<void> {
   await auth().currentUser?.getIdToken(true);
 }
 
-// TODO [CHALLENGE]: Implement session invalidation for removed staff (Scenario 6).
-// When an owner removes a staff member, their Firebase Auth session on their device
-// is still valid. Options:
-//   A) Revoke refresh tokens server-side (Firebase Admin SDK — requires Cloud Function)
-//   B) Check Firestore on every protected action — if user.active === false, block access
-//   C) Use custom claims to set a 'disabled' flag and check it in Firestore rules
-//
-// Whichever approach you choose, document WHY in DECISIONS.md.
-// The Firestore rule in seats/ is intentionally incomplete — your implementation goes there.
+// Session invalidation for removed staff runs in the `removeStaffMember` Cloud Function
+// (refresh token revocation + cleared claims). Call that from the app — no separate client RPC.
 export async function revokeUserSession(_userId: string): Promise<void> {
-  throw new Error('TODO [CHALLENGE]: Implement revokeUserSession via Cloud Function');
+  void _userId;
 }

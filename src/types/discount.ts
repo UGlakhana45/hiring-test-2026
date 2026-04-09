@@ -19,19 +19,31 @@ export function isDiscountValid(discount: Discount): boolean {
   return expiry > now && discount.usedCount < discount.usageLimit;
 }
 
-// TODO [CHALLENGE]: Implement discount application logic.
-// Given a discount and a line item type, return the discount amount.
-// Rules:
-//   - If appliesToBase is false, discount does NOT apply to base plan
-//   - If appliesToAddons is 'all', discount applies to all add-ons
-//   - If appliesToAddons is an array, only applies to listed addon types
-//   - An expired discount (validUntil < now) must be rejected — even if usedCount < usageLimit
-//   - Existing subscribers with an active Stripe subscription item using the discount:
-//     decide whether to honor until renewal or strip immediately. Document your decision.
+// Existing subscribers keep their discount until their next renewal date, at which point Stripe
+// will re-evaluate. This avoids unexpected mid-cycle price changes and matches how Stripe handles
+// coupon removals natively.
 export function calculateDiscountedPrice(
   _basePrice: number,
   _itemType: 'base' | AddonType,
   _discount: Discount,
 ): number {
-  throw new Error('TODO [CHALLENGE]: Implement calculateDiscountedPrice');
+  const now = new Date();
+  if (_discount.validUntil.toDate() < now) {
+    throw new Error('Discount expired');
+  }
+
+  let applies = false;
+  if (_itemType === 'base') {
+    applies = _discount.appliesToBase;
+  } else {
+    const scope = _discount.appliesToAddons;
+    applies = scope === 'all' ? true : scope.includes(_itemType);
+  }
+
+  if (!applies) {
+    return Math.round(_basePrice * 100) / 100;
+  }
+
+  const discounted = _basePrice * (1 - _discount.percentOff / 100);
+  return Math.round(discounted * 100) / 100;
 }

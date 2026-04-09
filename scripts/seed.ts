@@ -2,45 +2,74 @@
  * Seed script — populates the Firebase Emulator with realistic test data.
  * Run with: npm run seed
  *
- * Creates:
- *   - 1 clinic (Alpine Aesthetics Clinic)
- *   - 1 owner (sophie.owner@test.com / password: test1234)
- *   - 2 staff (anna.staff@test.com, marc.staff@test.com / password: test1234)
- *   - 2 patients (patient1@test.com, patient2@test.com / password: test1234)
- *   - 1 active Pro subscription
- *   - 1 active add-on (extra_storage)
- *   - 1 active discount (20% off base plan only)
- *   - 1 expired discount (15% off all add-ons — for Scenario 5)
- *   - 4 appointments (mix of statuses)
+ * Uses the Admin SDK so writes succeed regardless of Firestore rules (subscriptions/add-ons/discounts
+ * are server-only in rules). Auth users are created against the Auth emulator.
  */
 
-import { initializeApp } from 'firebase/app';
-import {
-  getFirestore, connectFirestoreEmulator,
-  collection, doc, setDoc, Timestamp,
-} from 'firebase/firestore';
-import {
-  getAuth, connectAuthEmulator,
-  createUserWithEmailAndPassword, updateProfile,
-} from 'firebase/auth';
+import * as admin from 'firebase-admin';
+import { syncCustomClaimsForAllClinicMembers } from '../functions/src/auth/claims';
 
-const firebaseConfig = {
-  apiKey: 'test-api-key',
-  authDomain: 'clinic-test-local.firebaseapp.com',
-  projectId: 'clinic-test-local',
-  storageBucket: 'clinic-test-local.appspot.com',
-  messagingSenderId: '000000000000',
-  appId: '1:000000000000:web:0000000000000000',
-};
+process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8090';
+process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9099';
 
-const app = initializeApp(firebaseConfig, 'seed');
-const auth = getAuth(app);
-const db = getFirestore(app);
-
-connectAuthEmulator(auth, 'http://localhost:9099', { disableWarnings: true });
-connectFirestoreEmulator(db, 'localhost', 8080);
+const app = admin.initializeApp({ projectId: 'clinic-test-local' });
+const db = admin.firestore(app);
+const auth = admin.auth(app);
 
 const CLINIC_ID = 'clinic_alpine_001';
+
+const SEED_EMAILS = [
+  'sophie.owner@test.com',
+  'anna.staff@test.com',
+  'marc.staff@test.com',
+  'patient1@test.com',
+  'patient2@test.com',
+];
+
+/** Remove prior seed so `npm run seed` can be re-run safely. */
+async function resetPriorSeed(): Promise<void> {
+  for (const email of SEED_EMAILS) {
+    try {
+      const user = await auth.getUserByEmail(email);
+      await auth.deleteUser(user.uid);
+    } catch {
+      // not registered
+    }
+  }
+
+  const userSnaps = await Promise.all(
+    SEED_EMAILS.map((email) => db.collection('users').where('email', '==', email).get()),
+  );
+  for (const snap of userSnaps) {
+    for (const d of snap.docs) {
+      await d.ref.delete();
+    }
+  }
+
+  const appointmentIds = ['appt_001', 'appt_002', 'appt_003', 'appt_004'];
+  for (const id of appointmentIds) {
+    await db.collection('appointments').doc(id).delete().catch(() => undefined);
+  }
+
+  await db.collection('discounts').doc('discount_welcome_001').delete().catch(() => undefined);
+  await db.collection('discounts').doc('discount_addons_exp').delete().catch(() => undefined);
+
+  const members = await db.collection('seats').doc(CLINIC_ID).collection('members').get();
+  for (const d of members.docs) {
+    await d.ref.delete();
+  }
+
+  await db
+    .collection('addons')
+    .doc(CLINIC_ID)
+    .collection('items')
+    .doc('addon_storage_001')
+    .delete()
+    .catch(() => undefined);
+
+  await db.collection('subscriptions').doc(CLINIC_ID).delete().catch(() => undefined);
+  await db.collection('clinics').doc(CLINIC_ID).delete().catch(() => undefined);
+}
 
 async function createUser(
   email: string,
@@ -49,132 +78,134 @@ async function createUser(
   role: 'owner' | 'staff' | 'patient',
   clinicId: string | null,
 ): Promise<string> {
-  const cred = await createUserWithEmailAndPassword(auth, email, password);
-  await updateProfile(cred.user, { displayName });
+  const user = await auth.createUser({
+    email,
+    password,
+    displayName,
+  });
 
-  await setDoc(doc(db, 'users', cred.user.uid), {
+  await db.collection('users').doc(user.uid).set({
     displayName,
     email,
     role,
     clinicId,
-    createdAt: Timestamp.now(),
+    createdAt: admin.firestore.Timestamp.now(),
   });
 
-  console.log(`  ✓ Created ${role}: ${email} (uid: ${cred.user.uid})`);
-  return cred.user.uid;
+  console.log(`  ✓ Created ${role}: ${email} (uid: ${user.uid})`);
+  return user.uid;
 }
 
 async function seed() {
   console.log('Seeding Firebase Emulator...\n');
 
-  // Users
-  console.log('Creating users...');
-  const ownerId   = await createUser('sophie.owner@test.com', 'test1234', 'Sophie Moreau',     'owner',   CLINIC_ID);
-  const staff1Id  = await createUser('anna.staff@test.com',   'test1234', 'Anna Kellenberger', 'staff',   CLINIC_ID);
-  const staff2Id  = await createUser('marc.staff@test.com',   'test1234', 'Marc Dubois',       'staff',   CLINIC_ID);
-  const patient1Id = await createUser('patient1@test.com',    'test1234', 'Léa Fontaine',      'patient', CLINIC_ID);
-  const patient2Id = await createUser('patient2@test.com',    'test1234', 'Thomas Müller',     'patient', CLINIC_ID);
+  console.log('Clearing any previous seed data...\n');
+  await resetPriorSeed();
 
-  // Clinic
+  console.log('Creating users...');
+  const ownerId = await createUser('sophie.owner@test.com', 'test1234', 'Sophie Moreau', 'owner', CLINIC_ID);
+  const staff1Id = await createUser('anna.staff@test.com', 'test1234', 'Anna Kellenberger', 'staff', CLINIC_ID);
+  const staff2Id = await createUser('marc.staff@test.com', 'test1234', 'Marc Dubois', 'staff', CLINIC_ID);
+  const patient1Id = await createUser('patient1@test.com', 'test1234', 'Léa Fontaine', 'patient', CLINIC_ID);
+  const patient2Id = await createUser('patient2@test.com', 'test1234', 'Thomas Müller', 'patient', CLINIC_ID);
+
   console.log('\nCreating clinic...');
-  await setDoc(doc(db, 'clinics', CLINIC_ID), {
+  await db.collection('clinics').doc(CLINIC_ID).set({
     name: 'Alpine Aesthetics Clinic',
     ownerId,
     plan: 'pro',
-    seats: { used: 2, max: 5 }, // 2 staff on Pro (5 seat limit)
+    seats: { used: 2, max: 5 },
     addons: ['addon_storage_001'],
-    activeDiscounts: ['WELCOME20'],
-    createdAt: Timestamp.now(),
+    activeDiscounts: ['WELCOME20', 'ADDONS15'],
+    createdAt: admin.firestore.Timestamp.now(),
   });
   console.log('  ✓ Clinic: Alpine Aesthetics Clinic');
 
-  // Subscription (Pro, active)
   console.log('\nCreating subscription...');
   const periodEnd = new Date();
-  periodEnd.setDate(periodEnd.getDate() + 18); // 18 days left in cycle
+  periodEnd.setDate(periodEnd.getDate() + 18);
 
-  await setDoc(doc(db, 'subscriptions', CLINIC_ID), {
+  await db.collection('subscriptions').doc(CLINIC_ID).set({
     clinicId: CLINIC_ID,
     plan: 'pro',
     status: 'active',
-    currentPeriodEnd: Timestamp.fromDate(periodEnd),
-    stripeCustomerId: 'cus_test_REPLACE_ME',
-    stripeSubscriptionId: 'sub_test_REPLACE_ME',
+    currentPeriodEnd: admin.firestore.Timestamp.fromDate(periodEnd),
+    // Omit fake Stripe ids — Checkout creates a real cus_… on first upgrade (see createCheckoutSession).
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
     gracePeriodEnd: null,
   });
   console.log('  ✓ Subscription: Pro, active, 18 days remaining');
 
-  // Add-on
   console.log('\nCreating add-on...');
-  await setDoc(doc(db, 'addons', CLINIC_ID, 'items', 'addon_storage_001'), {
-    clinicId: CLINIC_ID,
-    type: 'extra_storage',
-    price: 19,
-    active: true,
-    stripeItemId: 'si_test_REPLACE_ME',
-  });
+  await db
+    .collection('addons')
+    .doc(CLINIC_ID)
+    .collection('items')
+    .doc('addon_storage_001')
+    .set({
+      clinicId: CLINIC_ID,
+      type: 'extra_storage',
+      price: 19,
+      active: true,
+      stripeItemId: 'si_test_REPLACE_ME',
+    });
   console.log('  ✓ Add-on: Extra Storage (CHF 19/mo)');
 
-  // Discounts
   console.log('\nCreating discounts...');
-
-  // Active discount — applies to base plan only
   const validUntil = new Date();
   validUntil.setFullYear(validUntil.getFullYear() + 1);
-  await setDoc(doc(db, 'discounts', 'discount_welcome_001'), {
+  await db.collection('discounts').doc('discount_welcome_001').set({
     code: 'WELCOME20',
     percentOff: 20,
     appliesToBase: true,
-    appliesToAddons: [], // does NOT apply to add-ons — key test case for Scenario 3
-    validUntil: Timestamp.fromDate(validUntil),
+    appliesToAddons: [],
+    validUntil: admin.firestore.Timestamp.fromDate(validUntil),
     usageLimit: 100,
     usedCount: 1,
   });
   console.log('  ✓ Discount: WELCOME20 — 20% off base plan (valid 1 year)');
 
-  // Expired discount — 15% off all add-ons (for Scenario 5)
   const expiredDate = new Date();
-  expiredDate.setDate(expiredDate.getDate() - 7); // expired 7 days ago
-  await setDoc(doc(db, 'discounts', 'discount_addons_exp'), {
+  expiredDate.setDate(expiredDate.getDate() - 7);
+  await db.collection('discounts').doc('discount_addons_exp').set({
     code: 'ADDONS15',
     percentOff: 15,
     appliesToBase: false,
     appliesToAddons: 'all',
-    validUntil: Timestamp.fromDate(expiredDate),
+    validUntil: admin.firestore.Timestamp.fromDate(expiredDate),
     usageLimit: 50,
     usedCount: 3,
   });
   console.log('  ✓ Discount: ADDONS15 — 15% off all add-ons (EXPIRED — for Scenario 5)');
 
-  // Seats
   console.log('\nCreating seats...');
-  await setDoc(doc(db, 'seats', CLINIC_ID, 'members', ownerId), {
+  await db.collection('seats').doc(CLINIC_ID).collection('members').doc(ownerId).set({
     role: 'owner',
-    joinedAt: Timestamp.now(),
+    joinedAt: admin.firestore.Timestamp.now(),
     active: true,
   });
-  await setDoc(doc(db, 'seats', CLINIC_ID, 'members', staff1Id), {
+  await db.collection('seats').doc(CLINIC_ID).collection('members').doc(staff1Id).set({
     role: 'staff',
-    joinedAt: Timestamp.now(),
+    joinedAt: admin.firestore.Timestamp.now(),
     active: true,
   });
-  await setDoc(doc(db, 'seats', CLINIC_ID, 'members', staff2Id), {
+  await db.collection('seats').doc(CLINIC_ID).collection('members').doc(staff2Id).set({
     role: 'staff',
-    joinedAt: Timestamp.now(),
+    joinedAt: admin.firestore.Timestamp.now(),
     active: true,
   });
   console.log('  ✓ Seats: 1 owner + 2 staff active');
 
-  // Appointments
   console.log('\nCreating appointments...');
   const makeDate = (daysFromNow: number, hour: number) => {
     const d = new Date();
     d.setDate(d.getDate() + daysFromNow);
     d.setHours(hour, 0, 0, 0);
-    return Timestamp.fromDate(d);
+    return admin.firestore.Timestamp.fromDate(d);
   };
 
-  await setDoc(doc(db, 'appointments', 'appt_001'), {
+  await db.collection('appointments').doc('appt_001').set({
     patientId: patient1Id,
     staffId: staff1Id,
     clinicId: CLINIC_ID,
@@ -182,7 +213,7 @@ async function seed() {
     datetime: makeDate(1, 10),
     notes: 'Initial consultation',
   });
-  await setDoc(doc(db, 'appointments', 'appt_002'), {
+  await db.collection('appointments').doc('appt_002').set({
     patientId: patient2Id,
     staffId: staff2Id,
     clinicId: CLINIC_ID,
@@ -190,7 +221,7 @@ async function seed() {
     datetime: makeDate(3, 14),
     notes: null,
   });
-  await setDoc(doc(db, 'appointments', 'appt_003'), {
+  await db.collection('appointments').doc('appt_003').set({
     patientId: patient1Id,
     staffId: staff1Id,
     clinicId: CLINIC_ID,
@@ -198,7 +229,7 @@ async function seed() {
     datetime: makeDate(-5, 9),
     notes: 'Follow-up after treatment',
   });
-  await setDoc(doc(db, 'appointments', 'appt_004'), {
+  await db.collection('appointments').doc('appt_004').set({
     patientId: patient2Id,
     staffId: staff1Id,
     clinicId: CLINIC_ID,
@@ -207,6 +238,10 @@ async function seed() {
     notes: null,
   });
   console.log('  ✓ Appointments: 4 created (confirmed, scheduled, completed, canceled)');
+
+  console.log('\nSyncing Auth custom claims (role, clinicId, plan, seats)...');
+  await syncCustomClaimsForAllClinicMembers(db, CLINIC_ID, auth);
+  console.log('  ✓ Custom claims set for all users in clinic (force token refresh on next sign-in if needed)');
 
   console.log('\n✅ Seed complete!\n');
   console.log('Test accounts (password: test1234):');

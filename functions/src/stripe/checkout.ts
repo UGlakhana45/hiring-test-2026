@@ -1,15 +1,103 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
-import Stripe from 'stripe';
 import { getStripePriceIds, priceIdToPlan } from './priceIds';
 import { planSeatsForClaims } from './planConfig';
 import { countActiveSeats } from '../auth/claims';
+import { stripe } from './stripeClient';
+import { runStripeCall } from './stripeCall';
+import { stripeCheckoutReturnUrls } from './checkoutUrls';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-02-24.acacia',
-});
+function isLiveStripeCustomerId(id: unknown): id is string {
+  if (typeof id !== 'string') return false;
+  const s = id.trim();
+  if (!s.startsWith('cus_')) return false;
+  if (s.toUpperCase().includes('REPLACE')) return false;
+  return true;
+}
 
-/** Creates a Stripe Checkout session for a plan upgrade. */
+function discountIsValidForApply(data: {
+  validUntil: admin.firestore.Timestamp;
+  usedCount: number;
+  usageLimit: number;
+}): boolean {
+  const now = new Date();
+  return data.validUntil.toDate() > now && data.usedCount < data.usageLimit;
+}
+
+function discountAppliesToAddonType(
+  appliesToAddons: unknown,
+  addonType: 'extra_storage' | 'extra_seats' | 'advanced_analytics',
+): boolean {
+  if (appliesToAddons === 'all') return true;
+  if (Array.isArray(appliesToAddons)) {
+    return appliesToAddons.includes(addonType);
+  }
+  return false;
+}
+
+function requirePlanPriceId(plan: 'pro' | 'premium' | 'vip'): string {
+  const id = getStripePriceIds()[plan];
+  if (!id || id.includes('REPLACE_ME')) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `Set STRIPE_PRICE_${plan.toUpperCase()} in .env to a valid price_ ID and restart the emulator.`,
+    );
+  }
+  if (id.startsWith('prod_')) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `STRIPE_PRICE_${plan.toUpperCase()} is a Product ID (prod_), use the Price ID (price_) instead.`,
+    );
+  }
+  if (!/^price_[a-zA-Z0-9]+$/.test(id)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `STRIPE_PRICE_${plan.toUpperCase()} must be a Stripe Price ID (price_xxxx). Fix .env and restart.`,
+    );
+  }
+  return id;
+}
+
+function requireAddonPriceId(addonType: string, raw: string | undefined): string {
+  if (!raw || raw.includes('REPLACE_ME')) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `Set the Stripe price for add-on "${addonType}" in .env (STRIPE_PRICE_EXTRA_*) and restart.`,
+    );
+  }
+  if (raw.startsWith('prod_')) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `Add-on "${addonType}" uses a Product ID (prod_), use the Price ID (price_) instead.`,
+    );
+  }
+  if (!/^price_[a-zA-Z0-9]+$/.test(raw)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      `Add-on price for "${addonType}" must be a Stripe Price ID (price_). Fix .env and restart.`,
+    );
+  }
+  return raw;
+}
+
+async function ensureStripeCouponForDiscount(discountDocId: string, percentOff: number): Promise<string> {
+  try {
+    await stripe.coupons.retrieve(discountDocId);
+    return discountDocId;
+  } catch (err: unknown) {
+    const code = typeof err === 'object' && err !== null && 'code' in err ? (err as { code?: string }).code : undefined;
+    if (code !== 'resource_missing') {
+      throw err;
+    }
+    await stripe.coupons.create({
+      id: discountDocId,
+      percent_off: percentOff,
+      duration: 'once',
+    });
+    return discountDocId;
+  }
+}
+
 export const createCheckoutSession = functions.https.onCall(async (request) => {
   if (!request.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
 
@@ -31,42 +119,65 @@ export const createCheckoutSession = functions.https.onCall(async (request) => {
   const sub = subDoc.data();
   let customerId: string;
 
-  if (sub?.stripeCustomerId) {
+  if (isLiveStripeCustomerId(sub?.stripeCustomerId)) {
     customerId = sub.stripeCustomerId;
   } else {
     const clinicDoc = await db.collection('clinics').doc(clinicId).get();
     const clinic = clinicDoc.data();
-    const customer = await stripe.customers.create({
-      email: user.email,
-      name: clinic?.name,
-      metadata: { clinicId },
-    });
+    const customer = await runStripeCall(() =>
+      stripe.customers.create({
+        email: user.email,
+        name: clinic?.name,
+        metadata: { clinicId },
+      }),
+    );
     customerId = customer.id;
   }
 
-  // TODO [CHALLENGE]: Validate and apply discount code (Scenario 3 & 5).
   let stripeCouponId: string | undefined;
+  let discountDocId: string | undefined;
   if (discountCode) {
-    console.log('TODO [CHALLENGE]: Validate and apply discount code:', discountCode);
+    const discountSnap = await db
+      .collection('discounts')
+      .where('code', '==', discountCode)
+      .limit(1)
+      .get();
+    if (discountSnap.empty) {
+      throw new functions.https.HttpsError('invalid-argument', 'Invalid or expired discount code');
+    }
+    const discountDoc = discountSnap.docs[0];
+    discountDocId = discountDoc.id;
+    const d = discountDoc.data();
+    const validUntil = d.validUntil as admin.firestore.Timestamp | undefined;
+    const usedCount = typeof d.usedCount === 'number' ? d.usedCount : 0;
+    const usageLimit = typeof d.usageLimit === 'number' ? d.usageLimit : 0;
+    const percentOff = typeof d.percentOff === 'number' ? d.percentOff : 0;
+    const appliesToBase = d.appliesToBase === true;
+    if (!validUntil || !discountIsValidForApply({ validUntil, usedCount, usageLimit })) {
+      throw new functions.https.HttpsError('invalid-argument', 'Invalid or expired discount code');
+    }
+    if (!appliesToBase) {
+      throw new functions.https.HttpsError('invalid-argument', 'This discount does not apply to base plans');
+    }
+    stripeCouponId = await ensureStripeCouponForDiscount(discountDoc.id, percentOff);
   }
 
-  const PRICE_IDS = getStripePriceIds();
-  const session = await stripe.checkout.sessions.create({
-    customer: customerId,
-    mode: 'subscription',
-    line_items: [{ price: PRICE_IDS[plan], quantity: 1 }],
-    ...(stripeCouponId ? { discounts: [{ coupon: stripeCouponId }] } : {}),
-    metadata: { clinicId, plan },
-    success_url: 'clinicapp://billing?success=true',
-    cancel_url: 'clinicapp://billing?canceled=true',
-  });
-
+  const planPriceId = requirePlanPriceId(plan);
+  const { success_url, cancel_url } = stripeCheckoutReturnUrls();
+  const session = await runStripeCall(() =>
+    stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'subscription',
+      line_items: [{ price: planPriceId, quantity: 1 }],
+      ...(stripeCouponId ? { discounts: [{ coupon: stripeCouponId }] } : {}),
+      metadata: { clinicId, plan, ...(discountDocId ? { discountDocId } : {}) },
+      success_url,
+      cancel_url,
+    }),
+  );
   return { sessionId: session.id, url: session.url };
 });
 
-/**
- * Purchases an add-on for a clinic.
- */
 export const purchaseAddon = functions.https.onCall(async (request) => {
   if (!request.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
 
@@ -76,12 +187,74 @@ export const purchaseAddon = functions.https.onCall(async (request) => {
     discountCode?: string;
   };
 
-  // TODO [CHALLENGE]: Implement add-on purchase (Scenario 3).
-  console.log('TODO [CHALLENGE]: Implement purchaseAddon for', addonType, 'clinic', clinicId, discountCode);
-  throw new functions.https.HttpsError('unimplemented', 'TODO [CHALLENGE]: Implement purchaseAddon');
+  const db = admin.firestore();
+
+  const userDoc = await db.collection('users').doc(request.auth.uid).get();
+  const user = userDoc.data();
+  if (!user || user.role !== 'owner' || user.clinicId !== clinicId) {
+    throw new functions.https.HttpsError('permission-denied', 'Only clinic owners can manage billing');
+  }
+
+  const subDoc = await db.collection('subscriptions').doc(clinicId).get();
+  const sub = subDoc.data();
+  if (!sub?.stripeCustomerId || sub.status !== 'active' || !sub.stripeSubscriptionId) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'No active subscription — add-ons require an active base plan',
+    );
+  }
+  const customerId = sub.stripeCustomerId as string;
+
+  const PRICE_IDS = getStripePriceIds();
+  const rawAddonPrice = PRICE_IDS[addonType];
+  if (!rawAddonPrice) {
+    throw new functions.https.HttpsError('invalid-argument', 'Unknown add-on type');
+  }
+  const priceId = requireAddonPriceId(addonType, rawAddonPrice);
+
+  let stripeCouponId: string | undefined;
+  let discountDocId: string | undefined;
+  if (discountCode) {
+    const discountSnap = await db
+      .collection('discounts')
+      .where('code', '==', discountCode)
+      .limit(1)
+      .get();
+    if (discountSnap.empty) {
+      throw new functions.https.HttpsError('invalid-argument', 'Invalid or expired discount code');
+    }
+    const discountDoc = discountSnap.docs[0];
+    discountDocId = discountDoc.id;
+    const d = discountDoc.data();
+    const validUntil = d.validUntil as admin.firestore.Timestamp | undefined;
+    const usedCount = typeof d.usedCount === 'number' ? d.usedCount : 0;
+    const usageLimit = typeof d.usageLimit === 'number' ? d.usageLimit : 0;
+    const percentOff = typeof d.percentOff === 'number' ? d.percentOff : 0;
+    if (!validUntil || !discountIsValidForApply({ validUntil, usedCount, usageLimit })) {
+      throw new functions.https.HttpsError('invalid-argument', 'Invalid or expired discount code');
+    }
+    if (!discountAppliesToAddonType(d.appliesToAddons, addonType)) {
+      throw new functions.https.HttpsError('invalid-argument', 'Invalid or expired discount code');
+    }
+    stripeCouponId = await ensureStripeCouponForDiscount(discountDoc.id, percentOff);
+  }
+
+  const { success_url, cancel_url } = stripeCheckoutReturnUrls();
+  const session = await runStripeCall(() =>
+    stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'payment',
+      line_items: [{ price: priceId, quantity: 1 }],
+      ...(stripeCouponId ? { discounts: [{ coupon: stripeCouponId }] } : {}),
+      metadata: { clinicId, addonType, ...(discountDocId ? { discountDocId } : {}) },
+      success_url,
+      cancel_url,
+    }),
+  );
+
+  return { sessionId: session.id, url: session.url };
 });
 
-/** Initiates a plan downgrade. Blocks on seat conflicts; otherwise queues for period end. */
 export const initiateDowngrade = functions.https.onCall(async (request) => {
   if (!request.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
 
@@ -147,7 +320,6 @@ export const initiateDowngrade = functions.https.onCall(async (request) => {
   };
 });
 
-/** Removes a staff member: deactivates seat, wipes claims, revokes sessions. */
 export const removeStaffMember = functions.https.onCall(async (request) => {
   if (!request.auth) throw new functions.https.HttpsError('unauthenticated', 'Must be signed in');
 

@@ -11,6 +11,16 @@ export const PLAN_CONFIG_SERVER = {
 
 export const ADDON_SEATS_BONUS = 5; // Extra Seats Pack adds 5 seats per purchase
 
+/** CHF / month — keep in sync with `ADDON_CONFIG` in `src/types/subscription.ts` */
+export const ADDON_PRICE_SERVER: Record<
+  'extra_storage' | 'extra_seats' | 'advanced_analytics',
+  number
+> = {
+  extra_storage: 19,
+  extra_seats: 49,
+  advanced_analytics: 79,
+};
+
 export type PlanKey = keyof typeof PLAN_CONFIG_SERVER;
 
 export function planSeatsForClaims(plan: PlanKey): number {

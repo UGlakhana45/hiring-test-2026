@@ -12,6 +12,18 @@ export function useSubscription() {
   const seatsMax = clinic?.seats.max ?? config.seats;
   const seatsAvailable = seatsMax === Infinity ? Infinity : seatsMax - seatsUsed;
 
+  const gracePeriodEnd = subscription?.gracePeriodEnd ?? null;
+  const gracePeriodEndsAt =
+    gracePeriodEnd && typeof gracePeriodEnd.toDate === 'function'
+      ? gracePeriodEnd.toDate().toLocaleString(undefined, {
+          day: 'numeric',
+          month: 'short',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : null;
+
   return {
     plan,
     status: subscription?.status ?? 'canceled',
@@ -21,6 +33,8 @@ export function useSubscription() {
     seatsAvailable,
     isActive: subscription?.status === 'active',
     isGracePeriod: subscription?.status === 'grace_period',
+    gracePeriodEnd,
+    gracePeriodEndsAt,
     // True if clinic can add more staff
     canAddStaff: seatsAvailable > 0 && subscription?.status === 'active',
   };

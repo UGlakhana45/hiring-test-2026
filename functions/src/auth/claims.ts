@@ -96,10 +96,14 @@ export async function countActiveSeats(
   return snap.size;
 }
 
-/** Pushes up-to-date claims to every user in the clinic. */
+/**
+ * Pushes up-to-date claims to every user in the clinic.
+ * Pass `authSvc` when the caller uses a non-default Firebase App (e.g. seed script vs. functions bundle).
+ */
 export async function syncCustomClaimsForAllClinicMembers(
   db: admin.firestore.Firestore,
   clinicId: string,
+  authSvc: admin.auth.Auth = admin.auth(),
 ): Promise<void> {
   const { seatLimit, planId, activeAddons } = await computeSeatLimitForClinic(db, clinicId);
 
@@ -116,7 +120,7 @@ export async function syncCustomClaimsForAllClinicMembers(
       seatLimit,
       activeAddons,
     });
-    tasks.push(admin.auth().setCustomUserClaims(doc.id, payload as Record<string, unknown>));
+    tasks.push(authSvc.setCustomUserClaims(doc.id, payload as Record<string, unknown>));
   }
 
   await Promise.all(tasks);

@@ -53,7 +53,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     }),
 }));
 
-/** Call once at app startup. Uses onIdTokenChanged so forced refreshes propagate claims. */
+/** Uses onIdTokenChanged so forced refreshes propagate claims. */
 export function initAuthListener(): () => void {
   return auth().onIdTokenChanged(async (user) => {
     const { setFirebaseUser, loadUserProfile, setIdTokenClaims, reset } =
@@ -65,6 +65,11 @@ export function initAuthListener(): () => void {
       const current = useAuthStore.getState().userProfile;
       if (!current || current.id !== user.uid) {
         await loadUserProfile(user.uid);
+      }
+
+      const profileAfterLoad = useAuthStore.getState().userProfile;
+      if (!profileAfterLoad) {
+        await user.getIdToken(true);
       }
 
       const tokenResult = await user.getIdTokenResult();

@@ -1,22 +1,18 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
-import Stripe from 'stripe';
+import type Stripe from 'stripe';
 import { syncCustomClaimsForAllClinicMembers } from '../auth/claims';
 import { primaryPlanFromStripeItems } from './priceIds';
-import { PLAN_CONFIG_SERVER, planSeatsForClaims } from './planConfig';
+import { ADDON_PRICE_SERVER, PLAN_CONFIG_SERVER, planSeatsForClaims } from './planConfig';
 import { planTier, type PlanId } from '../types/authClaims';
+import { stripe } from './stripeClient';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-02-24.acacia',
-});
-
-const GRACE_PERIOD_DAYS = 7; // Matches Stripe Smart Retries window
+const GRACE_PERIOD_DAYS = 7;
 
 function stripeTs(unix: number): admin.firestore.Timestamp {
   return admin.firestore.Timestamp.fromDate(new Date(unix * 1000));
 }
 
-/** Stripe webhook — single entry point for all billing state changes. */
 export const handleStripeWebhook = functions.https.onRequest(async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
@@ -40,31 +36,26 @@ export const handleStripeWebhook = functions.https.onRequest(async (req, res) =>
         await handleCheckoutCompleted(db, session);
         break;
       }
-
       case 'customer.subscription.updated': {
         const sub = event.data.object as Stripe.Subscription;
         await handleSubscriptionUpdated(db, sub);
         break;
       }
-
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object as Stripe.Invoice;
         await handlePaymentSucceeded(db, invoice);
         break;
       }
-
       case 'invoice.payment_failed': {
         const invoice = event.data.object as Stripe.Invoice;
         await handlePaymentFailed(db, invoice);
         break;
       }
-
       case 'customer.subscription.deleted': {
         const sub = event.data.object as Stripe.Subscription;
         await handleSubscriptionDeleted(db, sub);
         break;
       }
-
       default:
         console.log(`Unhandled event type: ${event.type}`);
     }
@@ -76,15 +67,42 @@ export const handleStripeWebhook = functions.https.onRequest(async (req, res) =>
   }
 });
 
-// ---------------------------------------------------------------------------
-// checkout.session.completed
-// ---------------------------------------------------------------------------
-
 async function handleCheckoutCompleted(
   db: admin.firestore.Firestore,
   session: Stripe.Checkout.Session,
 ): Promise<void> {
   const clinicId = session.metadata?.clinicId;
+  const addonType = session.metadata?.addonType;
+  const discountDocId = session.metadata?.discountDocId;
+
+  if (clinicId && addonType) {
+    const allowed =
+      addonType === 'extra_storage' ||
+      addonType === 'extra_seats' ||
+      addonType === 'advanced_analytics';
+    if (!allowed) {
+      throw new Error('Invalid addonType in session metadata');
+    }
+    const itemRef = db
+      .collection('addons')
+      .doc(clinicId)
+      .collection('items')
+      .doc(`checkout_${session.id}`);
+    const price = ADDON_PRICE_SERVER[addonType];
+    await itemRef.set({
+      clinicId,
+      type: addonType,
+      price,
+      active: true,
+      stripeCheckoutSessionId: session.id,
+    });
+    await syncCustomClaimsForAllClinicMembers(db, clinicId);
+    if (discountDocId) {
+      await incrementDiscountUsedCount(db, discountDocId);
+    }
+    return;
+  }
+
   const plan = session.metadata?.plan as PlanId | undefined;
 
   if (!clinicId || !plan) {
@@ -130,11 +148,21 @@ async function handleCheckoutCompleted(
   });
 
   await syncCustomClaimsForAllClinicMembers(db, clinicId);
+
+  if (discountDocId) {
+    await incrementDiscountUsedCount(db, discountDocId);
+  }
 }
 
-// ---------------------------------------------------------------------------
-// customer.subscription.updated
-// ---------------------------------------------------------------------------
+async function incrementDiscountUsedCount(
+  db: admin.firestore.Firestore,
+  discountDocId: string,
+): Promise<void> {
+  const ref = db.collection('discounts').doc(discountDocId);
+  await ref.update({
+    usedCount: admin.firestore.FieldValue.increment(1),
+  });
+}
 
 async function handleSubscriptionUpdated(
   db: admin.firestore.Firestore,
@@ -209,7 +237,6 @@ async function handleSubscriptionUpdated(
     });
     await syncCustomClaimsForAllClinicMembers(db, clinicId);
   } else if (newTier < currentTier) {
-    // Mid-cycle downgrade: keep current tier, schedule the swap for period end
     if (!currentData?.downgradeAt) {
       await subDoc.ref.update({
         downgradeAt: periodEnd,
@@ -227,10 +254,6 @@ async function handleSubscriptionUpdated(
     await syncCustomClaimsForAllClinicMembers(db, clinicId);
   }
 }
-
-// ---------------------------------------------------------------------------
-// invoice.payment_succeeded
-// ---------------------------------------------------------------------------
 
 async function handlePaymentSucceeded(
   db: admin.firestore.Firestore,
@@ -257,10 +280,6 @@ async function handlePaymentSucceeded(
   await syncCustomClaimsForAllClinicMembers(db, clinicId);
 }
 
-// ---------------------------------------------------------------------------
-// invoice.payment_failed
-// ---------------------------------------------------------------------------
-
 async function handlePaymentFailed(
   db: admin.firestore.Firestore,
   invoice: Stripe.Invoice,
@@ -283,12 +302,7 @@ async function handlePaymentFailed(
     status: 'grace_period',
     gracePeriodEnd,
   });
-
 }
-
-// ---------------------------------------------------------------------------
-// customer.subscription.deleted
-// ---------------------------------------------------------------------------
 
 async function handleSubscriptionDeleted(
   db: admin.firestore.Firestore,
@@ -334,7 +348,6 @@ async function handleSubscriptionDeleted(
       .filter((d) => d.data()?.role !== 'owner')
       .slice(0, activeMembers.length - freeConfig.seats);
 
-    // Wipe claims before clearing clinicId — syncCustomClaims queries by clinicId
     for (const member of toDeactivate) {
       await admin.auth().setCustomUserClaims(member.id, {
         clinicId: null,

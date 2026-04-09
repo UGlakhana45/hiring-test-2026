@@ -1,6 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View, Text, ScrollView, StyleSheet, TouchableOpacity, Alert,
+  View,
+  Text,
+  ScrollView,
+  StyleSheet,
+  TouchableOpacity,
+  Alert,
+  TextInput,
+  ActivityIndicator,
 } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { useAuth } from '@/hooks/useAuth';
@@ -8,33 +15,44 @@ import { useClinic } from '@/hooks/useClinic';
 import { useSubscription } from '@/hooks/useSubscription';
 import { useAuthStore } from '@/store/authStore';
 import { getClinicAddons, getClinicDiscounts } from '@/services/firestore';
+import {
+  createCheckoutSession,
+  getHttpsCallableErrorMessage,
+  openCheckoutUrl,
+  purchaseAddon,
+} from '@/services/stripe';
 import { PlanBadge } from '@/components/PlanBadge';
 import { SeatUsageBar } from '@/components/SeatUsageBar';
 import { DiscountTag } from '@/components/DiscountTag';
-import { ADDON_CONFIG } from '@/types/subscription';
-import type { Addon } from '@/types/subscription';
+import { ADDON_CONFIG, PLAN_CONFIG } from '@/types/subscription';
+import type { Addon, Plan } from '@/types/subscription';
 import type { Discount } from '@/types/discount';
 
 export default function BillingScreen() {
-  const { isOwner } = useAuth();
+  const { isOwner, profile } = useAuth();
   const { clinic } = useClinic();
-  const { plan, status, config, seatsUsed, seatsMax } = useSubscription();
+  const clinicId = clinic?.id ?? profile?.clinicId ?? null;
+  const { plan, status, config, seatsUsed, seatsMax, gracePeriodEndsAt } = useSubscription();
   const [addons, setAddons] = useState<Addon[]>([]);
   const [discounts, setDiscounts] = useState<Discount[]>([]);
+  const [checkoutDiscountCode, setCheckoutDiscountCode] = useState('');
+  const [checkoutBusy, setCheckoutBusy] = useState<string | null>(null);
   const params = useLocalSearchParams<{ success?: string }>();
 
   // Force-refresh claims after checkout redirect so plan updates show immediately
   useEffect(() => {
-    if (params.success === 'true') {
-      useAuthStore.getState().refreshIdToken();
+    if (params.success !== 'true') return;
+    useAuthStore.getState().refreshIdToken();
+    if (clinicId) {
+      getClinicAddons(clinicId).then(setAddons);
     }
-  }, [params.success]);
+  }, [params.success, clinicId]);
 
   useEffect(() => {
-    if (!clinic) return;
-    getClinicAddons(clinic.id).then(setAddons);
-    getClinicDiscounts(clinic.id).then(setDiscounts);
-  }, [clinic?.id]);
+    if (!clinicId) return;
+    getClinicAddons(clinicId).then(setAddons);
+    getClinicDiscounts(clinicId).then(setDiscounts);
+  }, [clinicId]);
 
   if (!isOwner) {
     return (
@@ -44,17 +62,55 @@ export default function BillingScreen() {
     );
   }
 
-  function handleUpgrade() {
-    // TODO [CHALLENGE]: Open Stripe Checkout via createCheckoutSession (stripe.ts)
-    // Navigate to a plan selection screen, then call createCheckoutSession.
-    // After checkout, Stripe webhook → Cloud Function → Firestore update.
-    Alert.alert('TODO', 'Implement Stripe Checkout (Scenario 1)');
+  if (!clinicId) {
+    return (
+      <View style={styles.restricted}>
+        <Text style={styles.restrictedText}>
+          No clinic linked to this owner account. Run seed / onboarding so your user has a clinicId.
+        </Text>
+      </View>
+    );
   }
 
-  function handlePurchaseAddon(addonType: string) {
-    // TODO [CHALLENGE]: Call purchaseAddon from stripe.ts
-    // Remember: validate applicable discounts server-side (Scenario 3)
-    Alert.alert('TODO', `Implement add-on purchase for ${addonType} (Scenario 3)`);
+  const PLAN_ORDER: Plan[] = ['free', 'pro', 'premium', 'vip'];
+  const upgradeTargets = (['pro', 'premium', 'vip'] as const).filter(
+    (p) => PLAN_ORDER.indexOf(p) > PLAN_ORDER.indexOf(plan),
+  );
+
+  async function startPlanCheckout(targetPlan: 'pro' | 'premium' | 'vip') {
+    if (!clinicId) return;
+    const code = checkoutDiscountCode.trim() || undefined;
+    setCheckoutBusy(`plan:${targetPlan}`);
+    try {
+      const { url } = await createCheckoutSession({
+        clinicId,
+        plan: targetPlan,
+        discountCode: code,
+      });
+      await openCheckoutUrl(url);
+    } catch (e: unknown) {
+      Alert.alert('Checkout error', getHttpsCallableErrorMessage(e));
+    } finally {
+      setCheckoutBusy(null);
+    }
+  }
+
+  async function handlePurchaseAddon(addonType: string) {
+    if (!clinicId) return;
+    setCheckoutBusy(`addon:${addonType}`);
+    try {
+      const code = checkoutDiscountCode.trim() || undefined;
+      const { url } = await purchaseAddon({
+        clinicId,
+        addonType: addonType as 'extra_storage' | 'extra_seats' | 'advanced_analytics',
+        discountCode: code,
+      });
+      await openCheckoutUrl(url);
+    } catch (e: unknown) {
+      Alert.alert('Checkout error', getHttpsCallableErrorMessage(e));
+    } finally {
+      setCheckoutBusy(null);
+    }
   }
 
   return (
@@ -77,9 +133,8 @@ export default function BillingScreen() {
             <Text style={styles.warningText}>
               Payment failed. You have a grace period to resolve this.
               New staff cannot be added until billing is resolved.
+              {gracePeriodEndsAt ? `\n\nResolves by: ${gracePeriodEndsAt}` : ''}
             </Text>
-            {/* TODO [CHALLENGE]: Show gracePeriodEnd date from subscription */}
-            {/* TODO [CHALLENGE]: After grace period ends, plan reverts to Free (Scenario 4) */}
           </View>
         )}
       </View>
@@ -116,8 +171,9 @@ export default function BillingScreen() {
           return (
             <TouchableOpacity
               key={type}
-              style={styles.addonCard}
-              onPress={() => handlePurchaseAddon(type)}
+              style={[styles.addonCard, checkoutBusy !== null && styles.rowDisabled]}
+              onPress={() => void handlePurchaseAddon(type)}
+              disabled={checkoutBusy !== null}
             >
               <View>
                 <Text style={styles.addonName}>{meta.label}</Text>
@@ -125,7 +181,11 @@ export default function BillingScreen() {
               </View>
               <View style={styles.addonCardRight}>
                 <Text style={styles.addonPrice}>CHF {meta.price}/mo</Text>
-                <Text style={styles.addButton}>Add</Text>
+                {checkoutBusy === `addon:${type}` ? (
+                  <ActivityIndicator color="#3b82f6" />
+                ) : (
+                  <Text style={styles.addButton}>Add</Text>
+                )}
               </View>
             </TouchableOpacity>
           );
@@ -138,19 +198,59 @@ export default function BillingScreen() {
       {/* Active discounts */}
       {discounts.length > 0 && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Active discounts</Text>
+          <Text style={styles.sectionTitle}>Clinic discount codes</Text>
+          <Text style={styles.hintMuted}>
+            Valid / expired states below. Applying a code at checkout is validated on the server
+            (Scenario 5).
+          </Text>
           {discounts.map((d) => (
             <DiscountTag key={d.id} discount={d} />
           ))}
-          {/* TODO [CHALLENGE]: Scenario 5 — show expired discount state clearly */}
         </View>
       )}
 
-      {/* Upgrade CTA */}
-      {plan !== 'vip' && (
-        <TouchableOpacity style={styles.upgradeButton} onPress={handleUpgrade}>
-          <Text style={styles.upgradeText}>Upgrade plan</Text>
-        </TouchableOpacity>
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Discount code at checkout (optional)</Text>
+        <Text style={styles.hintMuted}>
+          Base plan upgrades: try WELCOME20. Add-ons ignore base-only codes (Scenario 3).
+        </Text>
+        <TextInput
+          style={styles.input}
+          placeholder="e.g. WELCOME20"
+          placeholderTextColor="#9ca3af"
+          autoCapitalize="characters"
+          value={checkoutDiscountCode}
+          onChangeText={setCheckoutDiscountCode}
+        />
+      </View>
+
+      {plan !== 'vip' && upgradeTargets.length > 0 && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Upgrade plan</Text>
+          {upgradeTargets.map((targetPlan) => (
+            <TouchableOpacity
+              key={targetPlan}
+              style={[styles.upgradeTierRow, checkoutBusy !== null && styles.rowDisabled]}
+              onPress={() => void startPlanCheckout(targetPlan)}
+              disabled={checkoutBusy !== null}
+            >
+              <View>
+                <Text style={styles.addonName}>{PLAN_CONFIG[targetPlan].label}</Text>
+                <Text style={styles.addonDesc}>
+                  CHF {PLAN_CONFIG[targetPlan].price}/mo ·{' '}
+                  {PLAN_CONFIG[targetPlan].seats === Infinity
+                    ? 'Unlimited seats'
+                    : `${PLAN_CONFIG[targetPlan].seats} seats`}
+                </Text>
+              </View>
+              {checkoutBusy === `plan:${targetPlan}` ? (
+                <ActivityIndicator color="#3b82f6" />
+              ) : (
+                <Text style={styles.addButton}>Checkout →</Text>
+              )}
+            </TouchableOpacity>
+          ))}
+        </View>
       )}
     </ScrollView>
   );
@@ -202,14 +302,29 @@ const styles = StyleSheet.create({
   addonPrice: { fontSize: 14, fontWeight: '700', color: '#111827' },
   addButton: { fontSize: 13, color: '#3b82f6', fontWeight: '600' },
   empty: { fontSize: 14, color: '#9ca3af' },
-  upgradeButton: {
-    backgroundColor: '#3b82f6',
-    borderRadius: 10,
-    padding: 16,
-    alignItems: 'center',
-    marginTop: 8,
+  hintMuted: { fontSize: 12, color: '#9ca3af', lineHeight: 16 },
+  input: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
+    color: '#111827',
+    backgroundColor: '#fff',
   },
-  upgradeText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  upgradeTierRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#dbeafe',
+    borderRadius: 8,
+    backgroundColor: '#f0f9ff',
+    marginBottom: 8,
+  },
   restricted: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 },
   restrictedText: { fontSize: 16, color: '#6b7280', textAlign: 'center' },
+  rowDisabled: { opacity: 0.55 },
 });

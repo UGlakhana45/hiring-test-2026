@@ -17,9 +17,17 @@ export function DiscountTag({ discount }: Props) {
       <Text style={[styles.code, !valid && styles.expired]}>{discount.code}</Text>
       <Text style={[styles.detail, !valid && styles.expired]}>
         {discount.percentOff}% off
-        {discount.appliesToBase && discount.appliesToAddons === 'all' && ' everything'}
-        {discount.appliesToBase && discount.appliesToAddons !== 'all' && !Array.isArray(discount.appliesToAddons) && ' base plan'}
-        {!discount.appliesToBase && ' add-ons only'}
+        {discount.appliesToBase && discount.appliesToAddons === 'all' && ' · base + all add-ons'}
+        {discount.appliesToBase &&
+          Array.isArray(discount.appliesToAddons) &&
+          discount.appliesToAddons.length === 0 &&
+          ' · base plan only'}
+        {discount.appliesToBase &&
+          Array.isArray(discount.appliesToAddons) &&
+          discount.appliesToAddons.length > 0 &&
+          ` · base + selected add-ons`}
+        {!discount.appliesToBase && discount.appliesToAddons === 'all' && ' · all add-ons'}
+        {!discount.appliesToBase && Array.isArray(discount.appliesToAddons) && ' · add-ons (scoped)'}
       </Text>
       {!valid && <Text style={styles.expiredLabel}>Expired {expiryStr}</Text>}
     </View>

@@ -12,6 +12,7 @@ import { format } from 'date-fns';
 export default function AppointmentsScreen() {
   const { profile, isStaff, isPatient } = useAuth();
   const { clinic } = useClinic();
+  const clinicId = clinic?.id ?? profile?.clinicId ?? null;
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -20,8 +21,8 @@ export default function AppointmentsScreen() {
 
     let unsubscribe: (() => void) | undefined;
 
-    if (isStaff && clinic) {
-      unsubscribe = subscribeToClinicAppointments(clinic.id, setAppointments);
+    if (isStaff && clinicId) {
+      unsubscribe = subscribeToClinicAppointments(clinicId, setAppointments);
     } else if (isPatient) {
       unsubscribe = subscribeToPatientAppointments(profile.id, setAppointments);
     }
@@ -29,7 +30,7 @@ export default function AppointmentsScreen() {
     // For now, they see an empty state with a message.
 
     return () => unsubscribe?.();
-  }, [profile?.id, clinic?.id, isStaff, isPatient]);
+  }, [profile?.id, clinicId, isStaff, isPatient]);
 
   function renderAppointment({ item }: { item: Appointment }) {
     const dt = item.datetime.toDate();

@@ -9,7 +9,6 @@ const firebaseConfig = {
   appId:             process.env.EXPO_PUBLIC_FIREBASE_APP_ID!,
 };
 
-// Initialize Firebase (safe to call multiple times — checks if already initialized)
 export const firebaseApp = getApps().length === 0
   ? initializeApp(firebaseConfig)
   : getApp();

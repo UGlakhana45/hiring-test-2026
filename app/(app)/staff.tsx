@@ -1,28 +1,43 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View, Text, FlatList, StyleSheet, TouchableOpacity, Alert,
+  View,
+  Text,
+  FlatList,
+  StyleSheet,
+  TouchableOpacity,
+  Alert,
+  Share,
+  ActivityIndicator,
 } from 'react-native';
 import { useAuth } from '@/hooks/useAuth';
 import { useClinic } from '@/hooks/useClinic';
 import { useSubscription } from '@/hooks/useSubscription';
 import { getClinicMembers } from '@/services/firestore';
+import {
+  getHttpsCallableErrorMessage,
+  removeStaffMember,
+  validateSeatInvite,
+} from '@/services/stripe';
 import { SeatUsageBar } from '@/components/SeatUsageBar';
 import type { User } from '@/types/user';
 
 export default function StaffScreen() {
-  const { isOwner } = useAuth();
+  const { isOwner, profile } = useAuth();
   const { clinic } = useClinic();
+  const clinicId = clinic?.id ?? profile?.clinicId ?? null;
   const { seatsUsed, seatsMax, canAddStaff, isGracePeriod } = useSubscription();
   const [members, setMembers] = useState<User[]>([]);
+  const [inviteBusy, setInviteBusy] = useState(false);
 
   useEffect(() => {
-    if (!clinic) return;
-    getClinicMembers(clinic.id).then((all) =>
+    if (!clinicId) return;
+    getClinicMembers(clinicId).then((all) =>
       setMembers(all.filter((u) => u.role === 'staff' || u.role === 'owner')),
     );
-  }, [clinic?.id]);
+  }, [clinicId]);
 
-  function handleInviteStaff() {
+  async function handleInviteStaff() {
+    if (!clinicId) return;
     if (!canAddStaff) {
       if (isGracePeriod) {
         Alert.alert('Billing issue', 'Your plan has a payment issue. Resolve billing before adding staff.');
@@ -31,12 +46,43 @@ export default function StaffScreen() {
       }
       return;
     }
-    // TODO [CHALLENGE]: Implement staff invitation.
-    // Options: email invite link, direct email-based add, shareable clinic code.
-    // Whatever you choose: the invite must create a user with role='staff' and clinicId set.
-    // The server must check seat availability BEFORE creating the record (Firestore rules).
-    // Document your approach in DECISIONS.md.
-    Alert.alert('TODO', 'Implement staff invite flow (see StaffScreen TODO)');
+    setInviteBusy(true);
+    try {
+      const check = await validateSeatInvite(clinicId);
+      if (!check.allowed) {
+        Alert.alert('Cannot invite', check.reason ?? 'Seat limit or subscription state blocks new staff.');
+        return;
+      }
+      const clinicLabel = clinic?.name ?? 'your clinic';
+      const inviteBody = [
+        `You're invited to join ${clinicLabel} on ClinicApp.`,
+        '',
+        `Clinic ID: ${clinicId}`,
+        '',
+        'Ask your admin how to get a staff account (e.g. they create your user in the console or you sign up and they assign the clinic).',
+      ].join('\n');
+
+      Alert.alert(
+        'You can invite staff',
+        `Server check passed (${check.activeSeats ?? '?'}/${check.seatLimit ?? '?'} seats). Share these details with your teammate.`,
+        [
+          {
+            text: 'Share…',
+            onPress: () => {
+              void Share.share({
+                title: `Join ${clinicLabel}`,
+                message: inviteBody,
+              });
+            },
+          },
+          { text: 'OK', style: 'default' },
+        ],
+      );
+    } catch (e: unknown) {
+      Alert.alert('Invite check failed', getHttpsCallableErrorMessage(e));
+    } finally {
+      setInviteBusy(false);
+    }
   }
 
   function handleRemoveStaff(user: User) {
@@ -49,14 +95,19 @@ export default function StaffScreen() {
           text: 'Remove',
           style: 'destructive',
           onPress: () => {
-            // TODO [CHALLENGE]: Implement staff removal + session invalidation (Scenario 6).
-            // Steps:
-            //   1. Set seats/{clinicId}/members/{userId}.active = false (server-side)
-            //   2. Update users/{userId}.role (or set clinicId to null)
-            //   3. Invalidate their auth session — call revokeUserSession from auth.ts
-            //   4. Decrement clinic.seats.used
-            // All of this should happen in a single Cloud Function to be atomic.
-            Alert.alert('TODO', 'Implement removeStaffMember Cloud Function (Scenario 6)');
+            if (!clinicId) return;
+            removeStaffMember({ clinicId, targetUserId: user.id })
+              .then(async () => {
+                const refreshed = await getClinicMembers(clinicId);
+                setMembers(refreshed.filter((u) => u.role === 'staff' || u.role === 'owner'));
+                Alert.alert(
+                  'Removed',
+                  `${user.displayName} was removed and their sessions were invalidated server-side.`,
+                );
+              })
+              .catch((e: unknown) => {
+                Alert.alert('Remove failed', getHttpsCallableErrorMessage(e));
+              });
           },
         },
       ],
@@ -96,10 +147,15 @@ export default function StaffScreen() {
         <SeatUsageBar used={seatsUsed} max={seatsMax} />
         {isOwner && (
           <TouchableOpacity
-            style={[styles.inviteButton, !canAddStaff && styles.inviteButtonDisabled]}
-            onPress={handleInviteStaff}
+            style={[styles.inviteButton, (!canAddStaff || inviteBusy) && styles.inviteButtonDisabled]}
+            onPress={() => void handleInviteStaff()}
+            disabled={!canAddStaff || inviteBusy}
           >
-            <Text style={styles.inviteText}>+ Invite staff</Text>
+            {inviteBusy ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.inviteText}>+ Invite staff</Text>
+            )}
           </TouchableOpacity>
         )}
       </View>
