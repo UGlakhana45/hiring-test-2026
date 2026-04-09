@@ -7,19 +7,15 @@
     "newArchEnabled": true,
     "scheme": "clinicapp",
     "platforms": [
-      "ios",
-      "android",
-      "web"
+      "ios"
     ],
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "org.reactjs.native.example.myapp",
       "googleServicesFile": "./GoogleService-Info.plist"
     },
-    "android": {
-      "package": "ch.blackcode.clinictest"
-    },
     "plugins": [
+      "expo-dev-client",
       "@react-native-firebase/app",
       [
         "@stripe/stripe-react-native",

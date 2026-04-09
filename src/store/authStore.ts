@@ -26,8 +26,12 @@ export const useAuthStore = create<AuthState>((set) => ({
   setFirebaseUser: (user) => set({ firebaseUser: user }),
 
   loadUserProfile: async (uid) => {
-    const profile = await getUser(uid);
-    set({ userProfile: profile, isLoading: false });
+    try {
+      const profile = await getUser(uid);
+      set({ userProfile: profile, isLoading: false });
+    } catch {
+      set({ userProfile: null, isLoading: false });
+    }
   },
 
   setIdTokenClaims: (claims) => set({ idTokenClaims: claims }),
@@ -65,6 +69,8 @@ export function initAuthListener(): () => void {
       const current = useAuthStore.getState().userProfile;
       if (!current || current.id !== user.uid) {
         await loadUserProfile(user.uid);
+      } else {
+        useAuthStore.setState({ isLoading: false });
       }
 
       const profileAfterLoad = useAuthStore.getState().userProfile;

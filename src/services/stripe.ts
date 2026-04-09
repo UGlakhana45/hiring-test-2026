@@ -1,51 +1,14 @@
 import { Linking } from 'react-native';
-import auth from '@react-native-firebase/auth';
+import functions from '@react-native-firebase/functions';
 
-/** Direct HTTP callable — the RNFB functions SDK is a no-op on iOS without native pods. */
+/**
+ * Call 1st-gen `onCall` functions via the native SDK (correct wire format + auth token).
+ * Manual `fetch` to `:5001/...` often returns 404 / non-JSON because callable HTTP is not plain REST.
+ */
 async function callFirebaseFunction<T>(name: string, data: unknown): Promise<T> {
-  const useEmulator = process.env.EXPO_PUBLIC_USE_EMULATOR === 'true';
-  const emulatorHost = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
-  const projectId = process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID ?? 'clinic-test-local';
-  const region = 'us-central1';
-
-  const url = useEmulator
-    ? `http://${emulatorHost}:5001/${projectId}/${region}/${name}`
-    : `https://${region}-${projectId}.cloudfunctions.net/${name}`;
-
-  const user = auth().currentUser;
-  const token = user ? await user.getIdToken() : null;
-
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ data }),
-  });
-
-  const text = await resp.text();
-
-  let json: { result?: T; error?: { message?: string; status?: string; details?: unknown } };
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`Cloud Function "${name}" returned invalid JSON (HTTP ${resp.status})`);
-  }
-
-  if (json.error) {
-    const err = new Error(json.error.message || `Cloud Function "${name}" error`) as Error & {
-      code: string;
-      details: unknown;
-    };
-    err.code = json.error.status ?? 'UNKNOWN';
-    err.details = json.error.details ?? null;
-    throw err;
-  }
-
-  return json.result as T;
+  const callable = functions().httpsCallable(name);
+  const result = await callable(data);
+  return (result?.data ?? result) as T;
 }
 
 function logCallableFailure(label: string, error: unknown): void {
