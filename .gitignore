@@ -19,9 +19,8 @@ functions/lib/
 *.orig.*
 web-build/
 
-# Firebase emulator logs & exports
-firebase-debug.log
-firestore-debug.log
+# Firebase emulator logs & exports (regenerated on each emulator run)
+*-debug.log
 firebase-export-*/
 
 # Debug session logs
