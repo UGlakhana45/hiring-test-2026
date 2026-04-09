@@ -46,6 +46,22 @@ export async function getClinicMembers(clinicId: string): Promise<User[]> {
   return snap.docs.map((d) => ({ id: d.id, ...d.data() }) as User);
 }
 
+export function subscribeToClinicMembers(
+  clinicId: string,
+  onUpdate: (users: User[]) => void,
+): () => void {
+  return firestore()
+    .collection("users")
+    .where("clinicId", "==", clinicId)
+    .onSnapshot((snap) => {
+      if (!snap?.docs) {
+        onUpdate([]);
+        return;
+      }
+      onUpdate(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as User));
+    });
+}
+
 // --- Subscriptions ---
 
 export function subscribeToSubscription(

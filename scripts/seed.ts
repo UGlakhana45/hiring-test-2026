@@ -9,7 +9,7 @@
 import * as admin from 'firebase-admin';
 import { syncCustomClaimsForAllClinicMembers } from '../functions/src/auth/claims';
 
-process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8090';
+process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8080';
 process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9099';
 
 const app = admin.initializeApp({ projectId: 'clinic-test-local' });
@@ -78,6 +78,13 @@ async function createUser(
   role: 'owner' | 'staff' | 'patient',
   clinicId: string | null,
 ): Promise<string> {
+  try {
+    const existing = await auth.getUserByEmail(email);
+    await auth.deleteUser(existing.uid);
+  } catch {
+    // no prior user
+  }
+
   const user = await auth.createUser({
     email,
     password,

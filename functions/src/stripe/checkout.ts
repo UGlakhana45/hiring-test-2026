@@ -1,8 +1,9 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
+import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { getStripePriceIds, priceIdToPlan } from './priceIds';
-import { planSeatsForClaims } from './planConfig';
-import { countActiveSeats } from '../auth/claims';
+import { PLAN_CONFIG_SERVER, planSeatsForClaims } from './planConfig';
+import { countActiveSeats, syncCustomClaimsForAllClinicMembers } from '../auth/claims';
 import { stripe } from './stripeClient';
 import { runStripeCall } from './stripeCall';
 import { stripeCheckoutReturnUrls } from './checkoutUrls';
@@ -273,9 +274,6 @@ export const initiateDowngrade = functions.https.onCall(async (request) => {
 
   const subDoc = await db.collection('subscriptions').doc(clinicId).get();
   const sub = subDoc.data();
-  if (!sub?.stripeSubscriptionId) {
-    throw new functions.https.HttpsError('failed-precondition', 'No active subscription to downgrade');
-  }
 
   const targetSeatLimit = planSeatsForClaims(targetPlan);
   const activeSeats = await countActiveSeats(db, clinicId);
@@ -289,8 +287,34 @@ export const initiateDowngrade = functions.https.onCall(async (request) => {
     };
   }
 
+  if (!sub?.stripeSubscriptionId) {
+    const targetConfig = PLAN_CONFIG_SERVER[targetPlan];
+    await db.runTransaction(async (tx) => {
+      tx.set(subDoc.ref, {
+        clinicId,
+        plan: targetPlan,
+        status: targetPlan === 'free' ? 'canceled' : 'active',
+        stripeCustomerId: sub?.stripeCustomerId ?? null,
+        stripeSubscriptionId: null,
+        currentPeriodEnd: sub?.currentPeriodEnd ?? null,
+        gracePeriodEnd: null,
+        downgradeAt: null,
+        scheduledPlan: null,
+      }, { merge: true });
+      tx.update(db.collection('clinics').doc(clinicId), {
+        plan: targetPlan,
+        'seats.max': targetConfig.seats,
+      });
+    });
+    await syncCustomClaimsForAllClinicMembers(db, clinicId);
+    return {
+      strategy: 'queued' as const,
+      effectiveDate: new Date().toISOString(),
+    };
+  }
+
   const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
-  const periodEnd = admin.firestore.Timestamp.fromDate(
+  const periodEnd = Timestamp.fromDate(
     new Date(stripeSub.current_period_end * 1000),
   );
 
@@ -350,7 +374,7 @@ export const removeStaffMember = functions.https.onCall(async (request) => {
       role: 'patient',
     });
     tx.update(db.collection('clinics').doc(clinicId), {
-      'seats.used': admin.firestore.FieldValue.increment(-1),
+      'seats.used': FieldValue.increment(-1),
     });
   });
 

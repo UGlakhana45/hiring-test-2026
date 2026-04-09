@@ -12,7 +12,7 @@ import {
 import { useAuth } from '@/hooks/useAuth';
 import { useClinic } from '@/hooks/useClinic';
 import { useSubscription } from '@/hooks/useSubscription';
-import { getClinicMembers } from '@/services/firestore';
+import { subscribeToClinicMembers } from '@/services/firestore';
 import {
   getHttpsCallableErrorMessage,
   removeStaffMember,
@@ -31,9 +31,10 @@ export default function StaffScreen() {
 
   useEffect(() => {
     if (!clinicId) return;
-    getClinicMembers(clinicId).then((all) =>
-      setMembers(all.filter((u) => u.role === 'staff' || u.role === 'owner')),
-    );
+    const unsub = subscribeToClinicMembers(clinicId, (all) => {
+      setMembers(all.filter((u) => u.role === 'staff' || u.role === 'owner'));
+    });
+    return unsub;
   }, [clinicId]);
 
   async function handleInviteStaff() {
@@ -97,9 +98,7 @@ export default function StaffScreen() {
           onPress: () => {
             if (!clinicId) return;
             removeStaffMember({ clinicId, targetUserId: user.id })
-              .then(async () => {
-                const refreshed = await getClinicMembers(clinicId);
-                setMembers(refreshed.filter((u) => u.role === 'staff' || u.role === 'owner'));
+              .then(() => {
                 Alert.alert(
                   'Removed',
                   `${user.displayName} was removed and their sessions were invalidated server-side.`,

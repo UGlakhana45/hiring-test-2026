@@ -8,6 +8,6 @@ const EMULATOR_HOST = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
 
 if (USE_EMULATOR) {
   auth().useEmulator(`http://${EMULATOR_HOST}:9099`);
-  firestore().useEmulator(EMULATOR_HOST, 8090);
+  firestore().useEmulator(EMULATOR_HOST, 8080);
   functions().useEmulator(EMULATOR_HOST, 5001);
 }

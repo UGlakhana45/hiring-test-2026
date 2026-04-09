@@ -1,4 +1,7 @@
 import { getApp, getApps, initializeApp } from '@react-native-firebase/app';
+import firestore from '@react-native-firebase/firestore';
+import auth from '@react-native-firebase/auth';
+import functions from '@react-native-firebase/functions';
 
 const firebaseConfig = {
   apiKey:            process.env.EXPO_PUBLIC_FIREBASE_API_KEY!,
@@ -12,3 +15,12 @@ const firebaseConfig = {
 export const firebaseApp = getApps().length === 0
   ? initializeApp(firebaseConfig)
   : getApp();
+
+let emulatorsConfigured = false;
+if (process.env.EXPO_PUBLIC_USE_EMULATOR === 'true' && !emulatorsConfigured) {
+  const host = process.env.EXPO_PUBLIC_EMULATOR_HOST ?? 'localhost';
+  firestore().useEmulator(host, 8080);
+  auth().useEmulator(`http://${host}:9099`);
+  functions().useEmulator(host, 5001);
+  emulatorsConfigured = true;
+}

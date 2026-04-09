@@ -1,5 +1,6 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
+import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import type Stripe from 'stripe';
 import { syncCustomClaimsForAllClinicMembers } from '../auth/claims';
 import { primaryPlanFromStripeItems } from './priceIds';
@@ -9,8 +10,11 @@ import { stripe } from './stripeClient';
 
 const GRACE_PERIOD_DAYS = 7;
 
-function stripeTs(unix: number): admin.firestore.Timestamp {
-  return admin.firestore.Timestamp.fromDate(new Date(unix * 1000));
+function stripeTs(unix: unknown): admin.firestore.Timestamp {
+  if (typeof unix !== 'number' || !Number.isFinite(unix)) {
+    return Timestamp.fromDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000));
+  }
+  return Timestamp.fromDate(new Date(unix * 1000));
 }
 
 export const handleStripeWebhook = functions.https.onRequest(async (req, res) => {
@@ -111,7 +115,7 @@ async function handleCheckoutCompleted(
 
   const planConfig = PLAN_CONFIG_SERVER[plan];
 
-  let periodEnd = admin.firestore.Timestamp.fromDate(
+  let periodEnd = Timestamp.fromDate(
     new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   );
   if (typeof session.subscription === 'string') {
@@ -160,7 +164,7 @@ async function incrementDiscountUsedCount(
 ): Promise<void> {
   const ref = db.collection('discounts').doc(discountDocId);
   await ref.update({
-    usedCount: admin.firestore.FieldValue.increment(1),
+    usedCount: FieldValue.increment(1),
   });
 }
 
@@ -185,7 +189,15 @@ async function handleSubscriptionUpdated(
   const currentPlan = (currentData?.plan as PlanId) ?? 'free';
 
   const newPlan = primaryPlanFromStripeItems(stripeSub.items);
-  const periodEnd = stripeTs(stripeSub.current_period_end);
+
+  let periodEndUnix: unknown = stripeSub.current_period_end;
+  if (typeof periodEndUnix !== 'number') {
+    try {
+      const fullSub = await stripe.subscriptions.retrieve(stripeSub.id);
+      periodEndUnix = fullSub.current_period_end;
+    } catch {}
+  }
+  const periodEnd = stripeTs(periodEndUnix);
   const now = new Date();
 
   const pendingDowngradeAt = currentData?.downgradeAt?.toDate?.() as Date | undefined;
@@ -294,7 +306,7 @@ async function handlePaymentFailed(
 
   if (snap.empty) return;
 
-  const gracePeriodEnd = admin.firestore.Timestamp.fromDate(
+  const gracePeriodEnd = Timestamp.fromDate(
     new Date(Date.now() + GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000),
   );
 
@@ -368,7 +380,7 @@ async function handleSubscriptionDeleted(
       });
     }
     batch.update(db.collection('clinics').doc(clinicId), {
-      'seats.used': admin.firestore.FieldValue.increment(-toDeactivate.length),
+      'seats.used': FieldValue.increment(-toDeactivate.length),
     });
     await batch.commit();
   }
